@@ -1532,6 +1532,9 @@ describe("stop reason propagation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
     };
   }
 
@@ -1675,6 +1678,9 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
     };
 
     const response = await agent.prompt({
@@ -1833,6 +1839,9 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
     };
     return agent.sessions[sessionId]!;
   }
@@ -1929,6 +1938,9 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
     };
     return agent.sessions[sessionId]!;
   }
@@ -2163,6 +2175,9 @@ describe("usage_update computation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
     };
   }
 
@@ -3062,6 +3077,9 @@ describe("emitRawSDKMessages", () => {
       abortController: new AbortController(),
       emitRawSDKMessages,
       contextWindowSize: 200000,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
     };
   }
 

@@ -151,6 +151,22 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Count of "real" user messages observed in `prompt()` since this in-memory
+   *  session was created. Used to fire `generateSessionTitle` at message 1
+   *  and message 3 only. Local-only commands (e.g. `/context`) and
+   *  empty/tool-only prompts do not count. */
+  realUserMessageCount: number;
+  /** Accumulated text of the first three real user messages, used as the
+   *  description for the third-pass title generation. Capped at 3 entries —
+   *  later messages don't trigger title work. */
+  recentUserPromptTexts: string[];
+  /** Monotonic sequence number incremented before each in-flight
+   *  `generateSessionTitle` call. Used to drop a slow first-pass response
+   *  whose result would otherwise overwrite a newer third-pass title. */
+  titleGenerationSequence: number;
+  /** Cache of the last `title` we pushed via `session_info_update`, so we don't
+   *  re-emit the same value on subsequent generations (e.g. resumed sessions). */
+  lastEmittedTitle?: string;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -687,6 +703,99 @@ export class ClaudeAcpAgent implements Agent {
     };
   }
 
+  /** Decide whether the just-arrived prompt is a "real" user message that
+   *  should advance our title generator. Local-only slash commands
+   *  (`/context`, `/heapdump`, etc.) and empty / tool-only prompts don't
+   *  represent the user's intent for the session and are skipped.
+   *  Returns the trimmed user text when real, otherwise null. */
+  private extractRealUserText(params: PromptRequest): string | null {
+    const firstTextBlock = params.prompt.find((p) => p.type === "text");
+    if (!firstTextBlock || typeof firstTextBlock.text !== "string") return null;
+    const text = firstTextBlock.text.trim();
+    if (text.length === 0) return null;
+    if (text.startsWith("/")) {
+      const command = text.split(" ", 1)[0];
+      if (LOCAL_ONLY_COMMANDS.has(command)) return null;
+    }
+    return text;
+  }
+
+  /** Run on every `prompt()` invocation. Increments the real-message counter
+   *  when applicable, fires `Query.generateSessionTitle` at counts 1 and 3,
+   *  and emits ACP `session_info_update` with the result. All errors are
+   *  logged and swallowed: title generation must never break a turn.
+   *
+   *  The first-pass call uses just the first prompt as the description.
+   *  The third-pass call concatenates the first three real user prompts so
+   *  the LLM has room to refine the title against the actual conversation
+   *  drift. After the third pass, this helper becomes a no-op until the
+   *  in-memory session is recreated.
+   *
+   *  Race protection: each call captures `titleGenerationSequence` before
+   *  awaiting the SDK and re-checks afterwards. A stale (lower-numbered)
+   *  response is dropped so the third-pass result reliably wins. */
+  private async maybeGenerateSessionTitleForTurn(
+    session: Session,
+    params: PromptRequest,
+  ): Promise<void> {
+    const realText = this.extractRealUserText(params);
+    if (realText === null) return;
+
+    session.realUserMessageCount += 1;
+    if (session.recentUserPromptTexts.length < 3) {
+      session.recentUserPromptTexts.push(realText);
+    }
+
+    const count = session.realUserMessageCount;
+    let description: string | null = null;
+    if (count === 1) {
+      description = realText;
+    } else if (count === 3) {
+      description = session.recentUserPromptTexts.join("\n\n");
+    }
+    if (description === null) return;
+
+    session.titleGenerationSequence += 1;
+    const mySequence = session.titleGenerationSequence;
+
+    // `generateSessionTitle` is implemented by the SDK's `Query` runtime but
+    // not yet declared in its `.d.ts` (as of @anthropic-ai/claude-agent-sdk
+    // 0.2.121). The structural cast bridges the gap; remove once the SDK
+    // exports it publicly.
+    type QueryWithTitleGen = {
+      generateSessionTitle: (
+        description: string,
+        options?: { persist?: boolean },
+      ) => Promise<string | undefined>;
+    };
+
+    let title: string | undefined;
+    try {
+      title = await (session.query as unknown as QueryWithTitleGen)
+        .generateSessionTitle(description, { persist: true });
+    } catch (err) {
+      this.logger.error(`generateSessionTitle failed (count=${count}): ${err}`);
+      return;
+    }
+
+    if (mySequence !== session.titleGenerationSequence) {
+      // A newer call (likely the third-pass refresh) superseded us; drop
+      // this stale response rather than emitting a regression.
+      return;
+    }
+    if (!title || title === session.lastEmittedTitle) return;
+    session.lastEmittedTitle = title;
+
+    try {
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "session_info_update", title },
+      });
+    } catch (err) {
+      this.logger.error(`session_info_update emit failed: ${err}`);
+    }
+  }
+
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway") {
       this.gatewayAuthMeta = _params._meta as GatewayAuthMeta | undefined;
@@ -709,6 +818,18 @@ export class ClaudeAcpAgent implements Agent {
       cachedWriteTokens: 0,
     };
 
+    // Fire-and-forget: track real user messages and ask the SDK to generate
+    // an LLM-summarized title at message 1 and message 3. Without this,
+    // ACP-driven sessions never get an `ai-title` because the binary's
+    // auto-title path is suppressed when `--setting-sources` includes
+    // `user`/`project`. The explicit `generateSessionTitle` control request
+    // bypasses that suppression and persists the result to JSONL via
+    // `persist: true`. Errors here must not break the turn — the helper
+    // logs and swallows.
+    this.maybeGenerateSessionTitleForTurn(session, params).catch(() => {
+      /* helper already logs */
+    });
+
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
@@ -728,7 +849,14 @@ export class ClaudeAcpAgent implements Agent {
     // These local-only commands return a result without replaying the user
     // message. Mark promptReplayed=true so their result isn't consumed as a
     // background task result.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    // Find the first text block consistently with `extractRealUserText` so
+    // the two local-only-command checks never disagree if a non-text block
+    // (e.g. resource link) sits before the user's text in `params.prompt`.
+    const firstTextBlock = params.prompt.find((p) => p.type === "text");
+    const firstText =
+      firstTextBlock && typeof firstTextBlock.text === "string"
+        ? firstTextBlock.text
+        : "";
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -2021,6 +2149,10 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      realUserMessageCount: 0,
+      recentUserPromptTexts: [],
+      titleGenerationSequence: 0,
+      lastEmittedTitle: undefined,
     };
 
     return {
